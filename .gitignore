@@ -1,0 +1,22 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# This app's cached SEC downloads (regenerated automatically, and can
+# get large -- shouldn't live in git)
+.cache/
+
+# Your real contact info -- never commit this, only .env.example
+.env
+
+# Editor/OS clutter
+.vscode/settings.json
+.DS_Store
+
+# Test cache
+.pytest_cache/
