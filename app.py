@@ -54,10 +54,27 @@ if st.session_state.df is not None:
     df = st.session_state.df
     st.subheader(f"{st.session_state.statement} -- {st.session_state.company}")
 
-    # Format big dollar numbers with commas so the table is readable.
-    display_df = df.copy()
-    for col in display_df.columns:
-        display_df[col] = display_df[col].apply(lambda v: f"{v:,.0f}" if pd.notnull(v) else "—")
+    # Format each row according to what kind of number it holds --
+    # dollar figures get comma separators, margins print as a percent,
+    # and ratios (like Debt/equity) print as a plain decimal. Without
+    # this, a 34.5% margin would get squashed to "0" by the old
+    # dollar-only formatting (f"{0.345:,.0f}" rounds to "0").
+    formats = sec_edgar.field_formats(statement)
+
+    def format_value(label: str, v: float) -> str:
+        if pd.isnull(v):
+            return "—"
+        kind = formats.get(label, "dollar")
+        if kind == "pct":
+            return f"{v:.1%}"
+        if kind == "ratio":
+            return f"{v:.2f}"
+        return f"{v:,.0f}"
+
+    display_df = df.astype(object)
+    for label in display_df.index:
+        for col in display_df.columns:
+            display_df.loc[label, col] = format_value(label, df.loc[label, col])
 
     # Let the user pick which line items ("some or all") to view/export.
     all_rows = list(df.index)
