@@ -137,6 +137,11 @@ def get_company_facts(cik: str) -> dict:
 # "instant" tags are balance-sheet-style: a snapshot at one date.
 # "duration" tags are income/cash-flow-style: a total over a period
 # (e.g. the quarter from 2026-04-01 to 2026-06-30).
+#
+# `category` groups fields under a subheading in the app's sidebar
+# (Tier 2) -- it doesn't affect the data at all, purely display
+# organization, e.g. so the Balance Sheet's checkboxes are grouped into
+# Assets / Liabilities / Equity instead of one long flat list.
 
 @dataclass
 class LineItem:
@@ -156,114 +161,392 @@ class LineItem:
     # DerivedMetric, a fallback fills gaps in a REAL line item -- it
     # only runs where the tags found nothing, never overriding an
     # actually-reported value.
+    category: str = "Other"
+    sign: float = 1.0
+    # A handful of cash-flow "IncreaseDecreaseInX" tags for ASSET
+    # accounts (receivables, prepaid expenses, other assets) are filed
+    # under GAAP's XBRL rules as "the asset balance increased by $Y"
+    # (positive Y) -- which is the OPPOSITE sign from how it's printed
+    # in the actual cash flow statement, where an asset increase is a
+    # USE of cash shown as a negative. Verified directly against Meta's
+    # own filed data: "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets"
+    # reports +3,230M for H1 2026, but the printed statement shows
+    # (3,230). Liability-side tags (AP, accrued liabilities) don't have
+    # this quirk -- their raw value already matches what's printed.
+    # `sign=-1` flips an asset-side tag's value so what this app shows
+    # matches what's actually on the filing.
 
 
 STATEMENTS: dict[str, list[LineItem]] = {
     "Balance Sheet": [
-        LineItem("Cash and cash equivalents", ["CashAndCashEquivalentsAtCarryingValue", "Cash"], "instant"),
-        LineItem("Short-term investments", ["ShortTermInvestments", "MarketableSecuritiesCurrent"], "instant"),
-        LineItem("Accounts receivable, net", ["AccountsReceivableNetCurrent"], "instant"),
-        LineItem("Inventory", ["InventoryNet"], "instant"),
-        LineItem("Prepaid expenses & other current assets", ["PrepaidExpenseAndOtherAssetsCurrent"], "instant"),
-        LineItem("Total current assets", ["AssetsCurrent"], "instant"),
-        LineItem("Property and equipment, net", ["PropertyPlantAndEquipmentNet"], "instant"),
-        LineItem("Operating lease right-of-use assets", ["OperatingLeaseRightOfUseAsset"], "instant"),
-        LineItem("Goodwill", ["Goodwill"], "instant"),
-        LineItem("Intangible assets, net", ["FiniteLivedIntangibleAssetsNet"], "instant"),
-        LineItem("Long-term investments", ["LongTermInvestments"], "instant"),
-        LineItem("Deferred tax assets", ["DeferredTaxAssetsNetNoncurrent"], "instant"),
-        LineItem("Other non-current assets", ["OtherAssetsNoncurrent"], "instant"),
-        LineItem("Total assets", ["Assets"], "instant"),
-        LineItem("Accounts payable", ["AccountsPayableCurrent"], "instant"),
-        LineItem("Accrued and other current liabilities", ["AccruedLiabilitiesCurrent"], "instant"),
-        LineItem("Operating lease liabilities, current", ["OperatingLeaseLiabilityCurrent"], "instant"),
-        LineItem("Long-term debt, current portion", ["LongTermDebtCurrent"], "instant"),
-        LineItem("Total current liabilities", ["LiabilitiesCurrent"], "instant"),
-        LineItem("Long-term debt", ["LongTermDebtNoncurrent", "LongTermDebt"], "instant"),
-        LineItem("Operating lease liabilities, non-current", ["OperatingLeaseLiabilityNoncurrent"], "instant"),
-        LineItem("Deferred tax liabilities", ["DeferredTaxLiabilitiesNoncurrent"], "instant"),
-        LineItem("Other long-term liabilities", ["OtherLiabilitiesNoncurrent"], "instant"),
-        LineItem("Total liabilities", ["Liabilities"], "instant"),
-        LineItem("Common stock & additional paid-in capital", ["AdditionalPaidInCapital"], "instant"),
+        LineItem(
+            "Cash and cash equivalents",
+            ["CashAndCashEquivalentsAtCarryingValue", "Cash"],
+            "instant",
+            category="Assets",
+        ),
+        LineItem(
+            "Short-term investments",
+            ["ShortTermInvestments", "MarketableSecuritiesCurrent"],
+            "instant",
+            category="Assets",
+        ),
+        LineItem("Accounts receivable, net", ["AccountsReceivableNetCurrent"], "instant", category="Assets"),
+        LineItem("Inventory", ["InventoryNet"], "instant", category="Assets"),
+        LineItem(
+            "Prepaid expenses & other current assets",
+            ["PrepaidExpenseAndOtherAssetsCurrent"],
+            "instant",
+            category="Assets",
+        ),
+        LineItem("Total current assets", ["AssetsCurrent"], "instant", category="Assets"),
+        LineItem(
+            "Property and equipment, net",
+            [
+                "PropertyPlantAndEquipmentNet",
+                # Meta stopped using the plain tag after Q3 2020 in
+                # favor of this longer one (which folds in finance
+                # lease right-of-use assets) -- verified against Meta's
+                # own filed data, where this second tag's value exactly
+                # matches the "Property and equipment, net" line for
+                # every period from 2021 through Q1 2026. Tesla, by
+                # contrast, reports its CURRENT quarter under this same
+                # longer tag, so this fixes both companies, even though
+                # neither uses the plain tag anymore for recent periods.
+                "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+            ],
+            "instant",
+            category="Assets",
+        ),
+        LineItem(
+            "Operating lease right-of-use assets",
+            ["OperatingLeaseRightOfUseAsset"],
+            "instant",
+            category="Assets",
+        ),
+        LineItem("Goodwill", ["Goodwill"], "instant", category="Assets"),
+        LineItem(
+            "Intangible assets, net", ["FiniteLivedIntangibleAssetsNet"], "instant", category="Assets"
+        ),
+        LineItem("Long-term investments", ["LongTermInvestments"], "instant", category="Assets"),
+        LineItem(
+            "Deferred tax assets", ["DeferredTaxAssetsNetNoncurrent"], "instant", category="Assets"
+        ),
+        LineItem("Other non-current assets", ["OtherAssetsNoncurrent"], "instant", category="Assets"),
+        LineItem("Total assets", ["Assets"], "instant", category="Assets"),
+        LineItem("Accounts payable", ["AccountsPayableCurrent"], "instant", category="Liabilities"),
+        LineItem(
+            "Accrued and other current liabilities",
+            ["AccruedLiabilitiesCurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem(
+            "Operating lease liabilities, current",
+            ["OperatingLeaseLiabilityCurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem(
+            "Long-term debt, current portion",
+            ["LongTermDebtCurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem("Total current liabilities", ["LiabilitiesCurrent"], "instant", category="Liabilities"),
+        LineItem(
+            "Long-term debt",
+            ["LongTermDebtNoncurrent", "LongTermDebt"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem(
+            "Operating lease liabilities, non-current",
+            ["OperatingLeaseLiabilityNoncurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem(
+            "Deferred tax liabilities",
+            ["DeferredTaxLiabilitiesNoncurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem(
+            "Other long-term liabilities",
+            ["OtherLiabilitiesNoncurrent"],
+            "instant",
+            category="Liabilities",
+        ),
+        LineItem("Total liabilities", ["Liabilities"], "instant", category="Liabilities"),
+        LineItem(
+            "Common stock & additional paid-in capital",
+            ["AdditionalPaidInCapital"],
+            "instant",
+            category="Equity",
+        ),
         LineItem(
             "Accumulated other comprehensive income (loss)",
             ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"],
             "instant",
+            category="Equity",
         ),
-        LineItem("Retained earnings", ["RetainedEarningsAccumulatedDeficit"], "instant"),
-        LineItem("Total stockholders' equity", ["StockholdersEquity"], "instant"),
-        LineItem("Total liabilities and equity", ["LiabilitiesAndStockholdersEquity"], "instant"),
+        LineItem(
+            "Retained earnings", ["RetainedEarningsAccumulatedDeficit"], "instant", category="Equity"
+        ),
+        LineItem("Total stockholders' equity", ["StockholdersEquity"], "instant", category="Equity"),
+        LineItem(
+            "Total liabilities and equity",
+            ["LiabilitiesAndStockholdersEquity"],
+            "instant",
+            category="Equity",
+        ),
     ],
     "Income Statement": [
-        LineItem("Total revenue", ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"], "duration"),
-        LineItem("Cost of revenue", ["CostOfRevenue"], "duration"),
+        LineItem(
+            "Total revenue",
+            ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],
+            "duration",
+            category="Revenue & gross profit",
+        ),
+        LineItem(
+            "Cost of revenue", ["CostOfRevenue"], "duration", category="Revenue & gross profit"
+        ),
         LineItem(
             "Gross profit",
             ["GrossProfit"],
             "duration",
             fallback=lambda r: _safe_sub(r.get("Total revenue"), r.get("Cost of revenue")),
+            category="Revenue & gross profit",
         ),
-        LineItem("Research and development", ["ResearchAndDevelopmentExpense"], "duration"),
-        LineItem("Sales and marketing", ["SellingAndMarketingExpense"], "duration"),
-        LineItem("General and administrative", ["GeneralAndAdministrativeExpense"], "duration"),
+        LineItem(
+            "Research and development",
+            ["ResearchAndDevelopmentExpense"],
+            "duration",
+            category="Operating expenses",
+        ),
+        LineItem(
+            "Sales and marketing",
+            ["SellingAndMarketingExpense"],
+            "duration",
+            category="Operating expenses",
+        ),
+        LineItem(
+            "General and administrative",
+            ["GeneralAndAdministrativeExpense"],
+            "duration",
+            category="Operating expenses",
+        ),
         LineItem(
             "Selling, general and administrative",
             ["SellingGeneralAndAdministrativeExpense"],
             "duration",
+            category="Operating expenses",
         ),
-        LineItem("Total operating expenses", ["CostsAndExpenses"], "duration"),
-        LineItem("Operating income", ["OperatingIncomeLoss"], "duration"),
-        LineItem("Interest income", ["InvestmentIncomeInterest"], "duration"),
-        LineItem("Interest expense", ["InterestExpense"], "duration"),
-        LineItem("Other income (expense), net", ["NonoperatingIncomeExpense"], "duration"),
+        LineItem(
+            "Total operating expenses", ["CostsAndExpenses"], "duration", category="Operating expenses"
+        ),
+        LineItem(
+            "Operating income", ["OperatingIncomeLoss"], "duration", category="Operating expenses"
+        ),
+        LineItem(
+            "Interest income",
+            ["InvestmentIncomeInterest"],
+            "duration",
+            category="Non-operating & taxes",
+        ),
+        LineItem(
+            "Interest expense", ["InterestExpense"], "duration", category="Non-operating & taxes"
+        ),
+        LineItem(
+            "Other income (expense), net",
+            ["NonoperatingIncomeExpense"],
+            "duration",
+            category="Non-operating & taxes",
+        ),
         LineItem(
             "Income before taxes",
             ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
             "duration",
+            category="Non-operating & taxes",
         ),
-        LineItem("Provision for income taxes", ["IncomeTaxExpenseBenefit"], "duration"),
-        LineItem("Net income", ["NetIncomeLoss"], "duration"),
-        LineItem("EPS, basic", ["EarningsPerShareBasic"], "duration", unit="USD/shares"),
-        LineItem("EPS, diluted", ["EarningsPerShareDiluted"], "duration", unit="USD/shares"),
+        LineItem(
+            "Provision for income taxes",
+            ["IncomeTaxExpenseBenefit"],
+            "duration",
+            category="Non-operating & taxes",
+        ),
+        LineItem("Net income", ["NetIncomeLoss"], "duration", category="Non-operating & taxes"),
+        LineItem(
+            "EPS, basic",
+            ["EarningsPerShareBasic"],
+            "duration",
+            unit="USD/shares",
+            category="Per share",
+        ),
+        LineItem(
+            "EPS, diluted",
+            ["EarningsPerShareDiluted"],
+            "duration",
+            unit="USD/shares",
+            category="Per share",
+        ),
         LineItem(
             "Weighted avg. shares, basic",
             ["WeightedAverageNumberOfSharesOutstandingBasic"],
             "duration",
             unit="shares",
+            category="Per share",
         ),
         LineItem(
             "Weighted avg. shares, diluted",
             ["WeightedAverageNumberOfDilutedSharesOutstanding"],
             "duration",
             unit="shares",
+            category="Per share",
         ),
     ],
     "Cash Flow Statement": [
-        LineItem("Depreciation and amortization", ["DepreciationDepletionAndAmortization"], "duration"),
-        LineItem("Stock-based compensation", ["ShareBasedCompensation"], "duration"),
-        LineItem("Deferred income taxes", ["DeferredIncomeTaxExpenseBenefit"], "duration"),
-        LineItem("Net cash from operating activities", ["NetCashProvidedByUsedInOperatingActivities"], "duration"),
-        LineItem("Capital expenditures", ["PaymentsToAcquirePropertyPlantAndEquipment"], "duration"),
-        LineItem("Purchases of investments", ["PaymentsToAcquireInvestments"], "duration"),
+        LineItem(
+            "Depreciation and amortization",
+            ["DepreciationDepletionAndAmortization"],
+            "duration",
+            category="Operating activities",
+        ),
+        LineItem(
+            "Stock-based compensation",
+            ["ShareBasedCompensation"],
+            "duration",
+            category="Operating activities",
+        ),
+        LineItem(
+            "Deferred income taxes",
+            ["DeferredIncomeTaxExpenseBenefit"],
+            "duration",
+            category="Operating activities",
+        ),
+        # Working-capital changes -- the "Changes in assets and
+        # liabilities" section of the cash flow statement. Each of
+        # these tags is verified against Meta's own filed H1-2026 data.
+        # ASSET-side tags (receivable, prepaid, other assets) need
+        # sign=-1 -- see the note on LineItem.sign above for why.
+        # LIABILITY-side tags (payable, accrued, other liabilities)
+        # don't need flipping; their raw value already matches what's
+        # printed on the statement.
+        LineItem(
+            "Change in accounts receivable",
+            ["IncreaseDecreaseInAccountsReceivable", "IncreaseDecreaseInAccountsReceivableTrade"],
+            "duration",
+            category="Working capital changes",
+            sign=-1,
+        ),
+        LineItem(
+            "Change in prepaid expenses & other current assets",
+            ["IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets", "IncreaseDecreaseInPrepaidExpense"],
+            "duration",
+            category="Working capital changes",
+            sign=-1,
+        ),
+        LineItem(
+            "Change in other assets",
+            ["IncreaseDecreaseInOtherOperatingAssets", "IncreaseDecreaseInOtherAssets"],
+            "duration",
+            category="Working capital changes",
+            sign=-1,
+        ),
+        LineItem(
+            "Change in accounts payable",
+            ["IncreaseDecreaseInAccountsPayableTrade", "IncreaseDecreaseInAccountsPayable"],
+            "duration",
+            category="Working capital changes",
+        ),
+        LineItem(
+            "Change in accrued expenses & other current liabilities",
+            ["IncreaseDecreaseInAccruedLiabilities", "IncreaseDecreaseInAccruedLiabilitiesCurrent"],
+            "duration",
+            category="Working capital changes",
+        ),
+        LineItem(
+            "Change in other liabilities",
+            ["IncreaseDecreaseInOtherOperatingLiabilities", "IncreaseDecreaseInOtherLiabilities"],
+            "duration",
+            category="Working capital changes",
+        ),
+        LineItem(
+            "Net cash from operating activities",
+            ["NetCashProvidedByUsedInOperatingActivities"],
+            "duration",
+            category="Operating activities",
+        ),
+        LineItem(
+            "Capital expenditures",
+            ["PaymentsToAcquirePropertyPlantAndEquipment"],
+            "duration",
+            category="Investing activities",
+        ),
+        LineItem(
+            "Purchases of investments",
+            [
+                "PaymentsToAcquireInvestments",
+                # Meta switched to this tag some time after 2022 (the
+                # plain tag above has no data for them past that point)
+                # -- verified against Meta's own filed Q1-2026 data,
+                # where this tag reports exactly $32,978M.
+                "PaymentsToAcquireAvailableForSaleSecuritiesDebt",
+            ],
+            "duration",
+            category="Investing activities",
+        ),
         LineItem(
             "Maturities/sales of investments",
-            ["ProceedsFromSaleMaturityAndCollectionsOfInvestments"],
+            [
+                "ProceedsFromSaleMaturityAndCollectionsOfInvestments",
+                "ProceedsFromSaleAndMaturityOfMarketableSecurities",
+            ],
             "duration",
+            category="Investing activities",
         ),
         LineItem(
             "Acquisitions, net of cash acquired",
             ["PaymentsToAcquireBusinessesNetOfCashAcquired"],
             "duration",
+            category="Investing activities",
         ),
-        LineItem("Net cash from investing activities", ["NetCashProvidedByUsedInInvestingActivities"], "duration"),
-        LineItem("Repurchases of common stock", ["PaymentsForRepurchaseOfCommonStock"], "duration"),
-        LineItem("Proceeds from debt issuance", ["ProceedsFromIssuanceOfLongTermDebt"], "duration"),
-        LineItem("Repayments of debt", ["RepaymentsOfLongTermDebt"], "duration"),
-        LineItem("Net cash from financing activities", ["NetCashProvidedByUsedInFinancingActivities"], "duration"),
+        LineItem(
+            "Net cash from investing activities",
+            ["NetCashProvidedByUsedInInvestingActivities"],
+            "duration",
+            category="Investing activities",
+        ),
+        LineItem(
+            "Repurchases of common stock",
+            ["PaymentsForRepurchaseOfCommonStock"],
+            "duration",
+            category="Financing activities",
+        ),
+        LineItem(
+            "Proceeds from debt issuance",
+            ["ProceedsFromIssuanceOfLongTermDebt"],
+            "duration",
+            category="Financing activities",
+        ),
+        LineItem(
+            "Repayments of debt",
+            ["RepaymentsOfLongTermDebt"],
+            "duration",
+            category="Financing activities",
+        ),
+        LineItem(
+            "Net cash from financing activities",
+            ["NetCashProvidedByUsedInFinancingActivities"],
+            "duration",
+            category="Financing activities",
+        ),
         LineItem(
             "Effect of exchange rate changes",
             ["EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
             "duration",
+            category="Other",
         ),
         LineItem(
             "Net change in cash",
@@ -272,6 +555,7 @@ STATEMENTS: dict[str, list[LineItem]] = {
                 "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
             ],
             "duration",
+            category="Other",
         ),
     ],
 }
@@ -315,6 +599,7 @@ class DerivedMetric:
     label: str
     formula: Callable[[dict[str, float | None]], float | None]
     fmt: str = "dollar"  # "dollar" | "pct" | "ratio" -- how app.py should display it
+    category: str = "Other"
 
 
 DERIVED_METRICS: dict[str, list[DerivedMetric]] = {
@@ -323,32 +608,50 @@ DERIVED_METRICS: dict[str, list[DerivedMetric]] = {
             "Gross margin %",
             lambda r: _safe_div(r.get("Gross profit"), r.get("Total revenue")),
             fmt="pct",
+            category="Revenue & gross profit",
         ),
         DerivedMetric(
             "Operating margin %",
             lambda r: _safe_div(r.get("Operating income"), r.get("Total revenue")),
             fmt="pct",
+            category="Operating expenses",
         ),
         DerivedMetric(
             "Net margin %",
             lambda r: _safe_div(r.get("Net income"), r.get("Total revenue")),
             fmt="pct",
+            category="Non-operating & taxes",
         ),
     ],
     "Cash Flow Statement": [
         DerivedMetric(
             "Free cash flow",
             lambda r: _safe_sub(r.get("Net cash from operating activities"), r.get("Capital expenditures")),
+            category="Operating activities",
+        ),
+        DerivedMetric(
+            "Change in working capital",
+            lambda r: _safe_add(
+                r.get("Change in accounts receivable"),
+                r.get("Change in prepaid expenses & other current assets"),
+                r.get("Change in other assets"),
+                r.get("Change in accounts payable"),
+                r.get("Change in accrued expenses & other current liabilities"),
+                r.get("Change in other liabilities"),
+            ),
+            category="Working capital changes",
         ),
     ],
     "Balance Sheet": [
         DerivedMetric(
             "Total debt",
             lambda r: _safe_add(r.get("Long-term debt"), r.get("Long-term debt, current portion")),
+            category="Leverage & liquidity",
         ),
         DerivedMetric(
             "LT (non-current) liabilities",
             lambda r: _safe_sub(r.get("Total liabilities"), r.get("Total current liabilities")),
+            category="Leverage & liquidity",
         ),
         DerivedMetric(
             # Depends on "Total debt" above -- see the note in
@@ -356,14 +659,140 @@ DERIVED_METRICS: dict[str, list[DerivedMetric]] = {
             "Debt / equity",
             lambda r: _safe_div(r.get("Total debt"), r.get("Total stockholders' equity")),
             fmt="ratio",
+            category="Leverage & liquidity",
         ),
         DerivedMetric(
             "Current ratio",
             lambda r: _safe_div(r.get("Total current assets"), r.get("Total current liabilities")),
             fmt="ratio",
+            category="Leverage & liquidity",
         ),
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Field toggle & preset system (Tier 2)
+# ---------------------------------------------------------------------------
+# A "preset" is just a named set of field labels, drawn from ANY
+# statement -- e.g. "Concise" mixes in Total revenue (Income Statement),
+# Total assets (Balance Sheet), and Free cash flow (Cash Flow
+# Statement) all in one preset. app.py intersects a preset's fields
+# with whichever single statement is on screen (see
+# preset_default_fields()) to decide that statement's default
+# checkboxes; the preset itself doesn't know or care which statement
+# each field belongs to.
+
+@dataclass
+class Preset:
+    label: str
+    fields: set[str]
+
+
+def statement_field_labels(statement: str) -> list[str]:
+    """Every label (raw line items, then derived metrics) that
+    build_statement(statement, ...) can produce, in the same order
+    build_statement uses. Doesn't touch the network -- these come
+    straight from STATEMENTS/DERIVED_METRICS, so the sidebar can show
+    toggles before any data has been fetched."""
+    items = STATEMENTS.get(statement, [])
+    metrics = DERIVED_METRICS.get(statement, [])
+    return [item.label for item in items] + [m.label for m in metrics]
+
+
+def statement_categories(statement: str) -> dict[str, list[str]]:
+    """Groups a statement's field labels by their `category`, preserving
+    each category's first-appearance order (so 'Assets' comes before
+    'Liabilities' for the Balance Sheet, etc.) -- what the sidebar loops
+    over to draw one subheading per category."""
+    groups: dict[str, list[str]] = {}
+    for item in STATEMENTS.get(statement, []):
+        groups.setdefault(item.category, []).append(item.label)
+    for metric in DERIVED_METRICS.get(statement, []):
+        groups.setdefault(metric.category, []).append(metric.label)
+    return groups
+
+
+def _all_field_labels() -> set[str]:
+    """Every label build_statement() can produce, across every
+    statement -- what the "Full" preset means."""
+    labels: set[str] = set()
+    for statement in STATEMENTS:
+        labels.update(statement_field_labels(statement))
+    return labels
+
+
+PRESETS: list[Preset] = [
+    Preset(
+        "Concise",
+        {
+            "Total revenue",
+            "Net income",
+            "Total assets",
+            "Total debt",
+            "Total stockholders' equity",
+            "Net cash from operating activities",
+            "Free cash flow",
+            "Cash and cash equivalents",
+            "Capital expenditures",
+            "Depreciation and amortization",
+            "Interest expense",
+            "Operating income",
+            "Total operating expenses",
+        },
+    ),
+    Preset("Full", _all_field_labels()),
+    Preset(
+        "Free Cash Flow Mode",
+        {
+            "Total revenue",
+            "Net income",
+            "Net cash from operating activities",
+            "Capital expenditures",
+            "Free cash flow",
+        },
+    ),
+    Preset(
+        "Profitability Mode",
+        {
+            "Total revenue",
+            "Gross profit",
+            "Gross margin %",
+            "Operating income",
+            "Operating margin %",
+            "Net income",
+            "Net margin %",
+            "EPS, diluted",
+        },
+    ),
+    Preset(
+        "Leverage Mode",
+        {
+            "Total assets",
+            "Total liabilities",
+            "Total debt",
+            "Total stockholders' equity",
+            "Debt / equity",
+            "Cash and cash equivalents",
+        },
+    ),
+]
+
+PRESETS_BY_LABEL: dict[str, Preset] = {p.label: p for p in PRESETS}
+
+
+def preset_default_fields(preset_label: str, statement: str) -> set[str]:
+    """Which of `statement`'s own fields the given preset turns on by
+    default -- the preset's full field set (which spans every
+    statement) intersected with what this one statement can actually
+    show. An unknown preset label falls back to "everything on" rather
+    than "everything off", so a typo never silently hides the whole
+    statement."""
+    preset = PRESETS_BY_LABEL.get(preset_label)
+    all_fields = set(statement_field_labels(statement))
+    if preset is None:
+        return all_fields
+    return preset.fields & all_fields
 
 
 # ---------------------------------------------------------------------------
@@ -386,26 +815,87 @@ def _quarterly_points(entries: list[dict], kind: str) -> dict[str, dict]:
     """Reduce raw fact entries down to one value per fiscal quarter,
     keyed by period end date, keeping only 10-Q / 10-K filed values
     (skips restated/duplicate values from other filings when possible
-    by preferring the most-recently-filed one)."""
+    by preferring the most-recently-filed one).
+
+    Some cash-flow-statement line items are only ever tagged
+    cumulatively -- six months, nine months, a full year -- and NEVER
+    as a standalone quarter. This is legitimate under SEC rules (a
+    10-Q's cash flow statement is allowed to be presented
+    year-to-date only, unlike the income statement, which usually also
+    breaks out the discrete quarter), and it's common for line items
+    that aren't a routine, every-quarter event -- verified directly
+    against Meta's own filed data for "proceeds from issuance of
+    long-term debt," which only ever appears as a 6-month, 9-month, or
+    full-year cumulative total, never a standalone quarter. Below,
+    after collecting genuine standalone-quarter entries the normal
+    way, a second pass derives a standalone quarter for any period end
+    that ONLY has a cumulative entry, the same way an analyst reading
+    the filing by hand would: this period's cumulative total minus the
+    previous period's cumulative total, walked forward one fiscal year
+    at a time. A period end that never gets an earlier cumulative
+    point to subtract from (e.g. no Q1 was ever reported) is left
+    unfilled rather than guessed at."""
     by_end: dict[str, dict] = {}
+    # For "duration" facts, every entry sharing the same `start` date
+    # belongs to the same fiscal-year cumulative chain (regardless of
+    # what that start date's actual month/day is, so this works for
+    # non-calendar fiscal years too) -- collected here so the second
+    # pass below can walk each chain from earliest to latest.
+    by_start: dict[str, dict[str, dict]] = {}
+
     for e in entries:
         if e.get("form") not in ("10-Q", "10-K"):
             continue
         if kind == "duration":
-            # Keep roughly-quarterly durations only (skip 6-month,
-            # 9-month, or full-year cumulative entries that share the
-            # same tag in a 10-Q/10-K).
             start = e.get("start")
             end = e.get("end")
             if not start or not end:
                 continue
             days = (pd.Timestamp(end) - pd.Timestamp(start)).days
+
+            chain = by_start.setdefault(start, {})
+            existing_chain_entry = chain.get(end)
+            if existing_chain_entry is None or e["filed"] > existing_chain_entry["filed"]:
+                chain[end] = e
+
             if not (75 <= days <= 100):
+                # Not a standalone quarter -- it may still be useful as
+                # a cumulative point in the second pass below, but it
+                # doesn't go directly into by_end.
                 continue
+
         end = e["end"]
         existing = by_end.get(end)
         if existing is None or e["filed"] > existing["filed"]:
             by_end[end] = e
+
+    if kind == "duration":
+        for start, chain in by_start.items():
+            ordered_ends = sorted(chain, key=lambda end: pd.Timestamp(end))
+            prev_cumulative_val = None
+            for end in ordered_ends:
+                if end in by_end:
+                    # Already have a genuine standalone-quarter value
+                    # here (e.g. Q1's ~90-day entry IS the cumulative
+                    # total so far, since it's the first quarter) --
+                    # never overwrite a real reported value, but DO use
+                    # it as the next subtraction's baseline.
+                    prev_cumulative_val = by_end[end]["val"]
+                    continue
+                entry = chain[end]
+                if prev_cumulative_val is not None:
+                    by_end[end] = {
+                        **entry,
+                        "val": entry["val"] - prev_cumulative_val,
+                        "derived": True,
+                    }
+                # Advance the baseline to this period's cumulative
+                # total regardless of whether we could derive a
+                # standalone value for it -- a later period in the same
+                # chain (e.g. the full year, once nine months is known)
+                # can still be derived from it even if this one couldn't.
+                prev_cumulative_val = entry["val"]
+
     return by_end
 
 
@@ -442,7 +932,7 @@ def build_statement(cik: str, statement: str, n_periods: int = 4) -> pd.DataFram
             tag_points = _quarterly_points(entries, item.kind)
             for end, point in tag_points.items():
                 points.setdefault(end, point)
-        row_data[item.label] = {end: point["val"] for end, point in points.items()}
+        row_data[item.label] = {end: point["val"] * item.sign for end, point in points.items()}
         all_period_ends.update(row_data[item.label].keys())
 
     period_ends = sorted(all_period_ends, reverse=True)[:n_periods]
