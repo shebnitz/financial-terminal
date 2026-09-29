@@ -74,5 +74,6 @@ quarterly (10-Q) toggle, comparing two companies side by side, or a
 simple line chart of a metric over time (Streamlit's `st.line_chart`
 takes a DataFrame directly).
 
+SCREENSHOT (v1.0)
 <img width="1903" height="947" alt="image" src="https://github.com/user-attachments/assets/84f8933f-e12f-40fe-bae9-6365af2d1518" />
 
