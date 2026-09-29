@@ -24,6 +24,17 @@ SEC EDGAR basics, in case you're new to it (most people are):
   ticker.
 - None of this needs an API key. It's free and open. The only rule is
   that we identify ourselves via a User-Agent header (see config.py).
+
+One thing SEC EDGAR does NOT have: live market data. A company's filed
+financial statements say nothing about what its stock is trading at
+right now, so the Comparables Analysis section near the bottom of this
+file (see build_comparables_table()) pulls Price / Market Cap / Beta /
+P-B / P-S from Finviz instead, via the free `finvizfinance` package --
+an unofficial library that reads finviz.com's own quote pages, not a
+documented API. That's a real trade-off worth knowing: unlike SEC's
+API, Finviz doesn't publish a stable contract, so a page redesign on
+their end can break this at any time with no warning. Charter Section 5
+covers this decision.
 """
 
 from __future__ import annotations
@@ -36,17 +47,68 @@ from typing import Callable
 
 import pandas as pd
 import requests
+import finvizfinance.quote as _finviz_quote_module
+from finvizfinance.quote import finvizfinance as _FinvizQuote
+from finvizfinance.util import number_convert as _finviz_number_convert
 
 import config
+
+# --- Patch a real bug in finvizfinance 1.5.0's own number_convert() ---
+# As of late Sept 2026, finviz.com started returning some fundament
+# fields as whitespace-only text (e.g. a non-breaking space) instead
+# of an actual value or a "-" placeholder. finvizfinance's own
+# number_convert() only special-cases a TRULY empty string or a literal
+# "-" (checked BEFORE it strips whitespace), so a whitespace-only value
+# slips past that check, gets stripped down to "", and then a bare
+# `num[-1]` blows up with "IndexError: string index out of range" --
+# an error that isn't even caught by finvizfinance's own `except
+# ValueError`, so it propagates all the way up and (via our own broad
+# except in get_market_data() below) shows up as "Couldn't get Finviz
+# market data for '<TICKER>': string index out of range" for every
+# single ticker, every time -- exactly the kind of "Finviz redesigned
+# their page and broke this overnight" failure the module docstring
+# above warns about.
+#
+# There's no reasonable upstream fix to wait on, so we patch it
+# ourselves: a safe wrapper that treats a whitespace-only (or "-")
+# value as "no data" (None) instead of crashing, then defers to
+# finvizfinance's real logic for everything else. quote.py did
+# `from finvizfinance.util import number_convert`, which copies the
+# NAME into quote.py's own module namespace -- so patching
+# finvizfinance.util.number_convert alone wouldn't affect the copy
+# quote.py already looked up. We have to reassign the name where
+# quote.py actually reads it from: finvizfinance.quote.number_convert.
+
+
+def _safe_finviz_number_convert(num: str) -> float | None:
+    if num is None:
+        return None
+    stripped = num.strip()
+    if not stripped or stripped == "-":
+        return None
+    return _finviz_number_convert(stripped)
+
+
+_finviz_quote_module.number_convert = _safe_finviz_number_convert
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL_TMPL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:0>10}.json"
 
 HEADERS = {"User-Agent": config.USER_AGENT}
 
+MAX_COMPARABLES_TICKERS = 10
+
 
 class SecEdgarError(Exception):
     """Raised when we can't get a clean answer back from SEC EDGAR."""
+
+
+class MarketDataError(Exception):
+    """Raised when we can't get a clean answer back from Finviz -- kept
+    as its own exception type (rather than reusing SecEdgarError) so
+    build_comparables_table() can tell "SEC has no data for this
+    ticker" apart from "Finviz has no market data for this ticker,"
+    which are different problems with different likely fixes."""
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1055,261 @@ def company_name(cik: str) -> str:
     return get_company_facts(cik).get("entityName", "")
 
 
+# ---------------------------------------------------------------------------
+# Comparables Analysis (Tier 3) -- Price / Market Cap / EV / Sales /
+# EBITDA / EBIT / Earnings / Beta / valuation multiples across up to 10
+# companies at once, matching the standard sell-side comps table
+# format. See the module docstring for why market data comes from
+# Finviz rather than SEC, and Charter Section 5 for the full design
+# writeup (period alignment, TTM math, the star-marking rule).
+#
+# Note on naming: "TEV" (Total Enterprise Value) and "EV" (Enterprise
+# Value) mean the same thing -- Kevin asked for the shorter "EV" label
+# to match how he labels it on his own comps sheets, so that's what
+# this column (and the EV/Sales, EV/EBITDA, EV/EBIT multiples that
+# divide by it) is called everywhere below.
+# ---------------------------------------------------------------------------
+
+COMPARABLES_COLUMNS = [
+    "Price",
+    "Market Cap",
+    "EV",
+    "Sales",
+    "EBITDA",
+    "EBIT",
+    "Earnings",
+    "Beta",
+    "EV/Sales",
+    "EV/EBITDA",
+    "EV/EBIT",
+    "P/E",
+]
+
+# Average/Median only ever get computed over these four -- a company's
+# raw dollar figures (Sales, Market Cap, ...) aren't meaningfully
+# "averaged" across a comp set the way a valuation multiple is; that's
+# exactly what the real comps table screenshot this was built from
+# shows too (blank Market Data / Financial Data cells on those rows).
+_COMPARABLES_MULTIPLE_COLUMNS = ["EV/Sales", "EV/EBITDA", "EV/EBIT", "P/E"]
+
+# Beta gets an Average too (a plain arithmetic mean, same as the four
+# multiples above), but no Median -- Kevin only asked for the average,
+# and it isn't part of the original screenshot's Valuation block, so it
+# gets its own small list rather than joining _COMPARABLES_MULTIPLE_COLUMNS
+# (which drives BOTH Average and Median).
+_COMPARABLES_AVERAGE_ONLY_COLUMNS = ["Beta"]
+
+
+def get_market_data(ticker: str) -> dict[str, float | None]:
+    """Live market data for one ticker, from Finviz: current share
+    price, market capitalization, beta, and Finviz's own P/E, P/B, P/S.
+    finvizfinance's raw=False option converts Finviz's formatted page
+    text ("168.04B", "4.02%") into plain floats for us, so every value
+    here is already a number (or None if Finviz didn't have it).
+
+    Finviz isn't a documented API -- finvizfinance works by reading
+    finviz.com's own quote page, so ANY failure here (bad ticker,
+    finviz.com being briefly unreachable, finviz changing their page
+    layout) gets caught broadly and turned into one clear
+    MarketDataError, rather than leaking a scraping-library-specific
+    exception type up into app.py."""
+    try:
+        quote = _FinvizQuote(ticker)
+        fundament = quote.ticker_fundament(raw=False)
+    except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring above
+        raise MarketDataError(f"Couldn't get Finviz market data for '{ticker}': {e}") from e
+
+    return {
+        "Price": fundament.get("Price"),
+        "Market Cap": fundament.get("Market Cap"),
+        "Beta": fundament.get("Beta"),
+        "P/E": fundament.get("P/E"),
+        "P/B": fundament.get("P/B"),
+        "P/S": fundament.get("P/S"),
+    }
+
+
+def _company_period_is_annual_only(cik: str) -> bool:
+    """True when this company's most recently available quarter is
+    really a full fiscal year total -- either because their latest
+    filing is a 10-K with no 10-Q having followed it yet, or because
+    that period only exists as a DERIVED value (see _quarterly_points'
+    year-to-date subtraction) rather than a directly reported discrete
+    quarter. Either way, a "quarter" built from it actually spans more
+    than three months. build_comparables_table() star-marks a
+    company's name when this is true (Charter Section 5)."""
+    company_facts = get_company_facts(cik)
+    revenue_item = next(item for item in STATEMENTS["Income Statement"] if item.label == "Total revenue")
+
+    points: dict[str, dict] = {}
+    for tag in revenue_item.tags:
+        entries = _facts_for_tag(company_facts, tag, unit=revenue_item.unit)
+        for end, point in _quarterly_points(entries, revenue_item.kind).items():
+            points.setdefault(end, point)
+
+    if not points:
+        return False
+
+    latest_end = max(points, key=lambda end: pd.Timestamp(end))
+    latest_point = points[latest_end]
+    return bool(latest_point.get("derived")) or latest_point.get("form") == "10-K"
+
+
+def _ttm_sum(df: pd.DataFrame, label: str) -> float | None:
+    """Sum of a duration-type row's available quarters in `df`, which
+    is expected to already be a build_statement(..., n_periods=4)
+    result -- so this sums up to the trailing four reported quarters.
+    A company with fewer than four quarters of data (a recent IPO, or
+    a gap our tag coverage hasn't caught yet -- see
+    TAG_COVERAGE_GUIDE.md) sums whatever it has rather than padding the
+    rest with a guess, which understates a true trailing-twelve-months
+    figure; that's a known, honest limitation, not a bug."""
+    if label not in df.index:
+        return None
+    values = df.loc[label].dropna()
+    if values.empty:
+        return None
+    return float(values.sum())
+
+
+def comparables_field_formats() -> dict[str, str]:
+    """Maps each build_comparables_table() column to a display-format
+    hint: 'price' ($/share, 2 decimals), 'dollar_m' (a dollar figure
+    shown in millions -- the standard way a comps table is presented;
+    nobody prints a market cap out to the individual dollar), 'beta'
+    (a plain two-decimal number, e.g. "0.98" -- betas are already a
+    small unitless ratio, so unlike 'multiple' there's no 'x' suffix),
+    or 'multiple' (one decimal place plus an 'x' suffix, e.g. "14.1x")."""
+    formats = {"Price": "price", "Beta": "beta"}
+    for col in ["Market Cap", "EV", "Sales", "EBITDA", "EBIT", "Earnings"]:
+        formats[col] = "dollar_m"
+    for col in _COMPARABLES_MULTIPLE_COLUMNS:
+        formats[col] = "multiple"
+    return formats
+
+
+def build_comparables_table(tickers: list[str]) -> tuple[pd.DataFrame, dict[str, str]]:
+    """The Comparables Analysis table: Price / Market Cap / EV / Sales /
+    EBITDA / EBIT / Earnings / Beta / EV-Sales / EV-EBITDA / EV-EBIT /
+    P-E for up to MAX_COMPARABLES_TICKERS tickers, plus Average and
+    Median summary rows over the four valuation-multiple columns (and
+    an Average-only row for Beta) -- built to match a standard
+    sell-side comps table exactly.
+
+    Definitions (Charter Section 5 has the full writeup):
+    - Sales / EBITDA / EBIT / Earnings are trailing-twelve-months (TTM)
+      -- the sum of each company's own most recently reported four
+      quarters, NOT a calendar-aligned year, so two companies with
+      different fiscal year ends still compare fairly. EBITDA =
+      Operating income + Depreciation and amortization; EBIT is
+      treated as Operating income directly, the standard shorthand
+      every comps table uses.
+    - Price, Market Cap, and Beta come from Finviz (see the module
+      docstring). EV (Enterprise Value -- some call it TEV, Total
+      Enterprise Value, same thing) = Market Cap + Total debt - Cash
+      and cash equivalents, with a missing debt or cash figure treated
+      as $0 rather than leaving EV blank -- a company with no reported
+      debt tag usually means it has none, not that the number is
+      unknown.
+    - P/E here is Market Cap / Earnings (TTM), computed from OUR OWN
+      EDGAR-sourced earnings figure -- not Finviz's own P/E -- so it's
+      built the same consistent way as the other three multiples. This
+      can differ slightly from what Finviz's own quote page shows,
+      which may use adjusted or forward EPS.
+    - A company name gets a trailing " *" when its most recent period
+      is really a full fiscal year (see _company_period_is_annual_only)
+      -- its TTM figures still sum four real quarters, but the
+      balance-sheet snapshot (Total debt, Cash) is as of that fiscal
+      year-end, possibly a quarter or two stale.
+
+    Returns (dataframe, errors) -- errors maps any ticker that failed
+    (bad symbol, no SEC data, a Finviz lookup failure, ...) to a plain
+    -English reason, with that ticker simply left out of the table
+    rather than failing the whole request. One bad ticker in a list of
+    ten should never cost you the other nine.
+    """
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+    if len(tickers) > MAX_COMPARABLES_TICKERS:
+        raise SecEdgarError(
+            f"Comparables Analysis supports at most {MAX_COMPARABLES_TICKERS} tickers at a time "
+            f"(got {len(tickers)})."
+        )
+
+    rows: dict[str, dict[str, float | None]] = {}
+    errors: dict[str, str] = {}
+
+    for ticker in tickers:
+        try:
+            cik = get_cik_for_ticker(ticker)
+            name = company_name(cik) or ticker
+            if _company_period_is_annual_only(cik):
+                name = f"{name} *"
+
+            income_df = build_statement(cik, "Income Statement", n_periods=4)
+            cash_flow_df = build_statement(cik, "Cash Flow Statement", n_periods=4)
+            balance_df = build_statement(cik, "Balance Sheet", n_periods=1)
+
+            sales = _ttm_sum(income_df, "Total revenue")
+            ebit = _ttm_sum(income_df, "Operating income")
+            earnings = _ttm_sum(income_df, "Net income")
+            d_and_a = _ttm_sum(cash_flow_df, "Depreciation and amortization")
+            ebitda = ebit + d_and_a if ebit is not None and d_and_a is not None else None
+
+            latest_bs_col = balance_df.columns[0] if len(balance_df.columns) else None
+            total_debt = balance_df.loc["Total debt", latest_bs_col] if latest_bs_col is not None else None
+            cash = (
+                balance_df.loc["Cash and cash equivalents", latest_bs_col]
+                if latest_bs_col is not None
+                else None
+            )
+            if pd.isnull(total_debt):
+                total_debt = None
+            if pd.isnull(cash):
+                cash = None
+
+            market = get_market_data(ticker)
+            price = market.get("Price")
+            market_cap = market.get("Market Cap")
+            beta = market.get("Beta")
+
+            ev = market_cap + (total_debt or 0.0) - (cash or 0.0) if market_cap is not None else None
+
+            rows[name] = {
+                "Price": price,
+                "Market Cap": market_cap,
+                "EV": ev,
+                "Sales": sales,
+                "EBITDA": ebitda,
+                "EBIT": ebit,
+                "Earnings": earnings,
+                "Beta": beta,
+                "EV/Sales": _safe_div(ev, sales),
+                "EV/EBITDA": _safe_div(ev, ebitda),
+                "EV/EBIT": _safe_div(ev, ebit),
+                "P/E": _safe_div(market_cap, earnings),
+            }
+        except (SecEdgarError, MarketDataError) as e:
+            errors[ticker] = str(e)
+        except Exception as e:  # noqa: BLE001 -- last-resort isolation, see docstring above
+            errors[ticker] = f"Unexpected error: {e}"
+
+    df = pd.DataFrame.from_dict(rows, orient="index", columns=COMPARABLES_COLUMNS)
+
+    if not df.empty:
+        summary: dict[str, dict[str, float | None]] = {"Average": {}, "Median": {}}
+        for col in _COMPARABLES_MULTIPLE_COLUMNS:
+            values = df[col].dropna()
+            summary["Average"][col] = float(values.mean()) if not values.empty else None
+            summary["Median"][col] = float(values.median()) if not values.empty else None
+        for col in _COMPARABLES_AVERAGE_ONLY_COLUMNS:  # Beta: Average only, no Median
+            values = df[col].dropna()
+            summary["Average"][col] = float(values.mean()) if not values.empty else None
+        for label in ("Average", "Median"):
+            df.loc[label] = {col: summary[label].get(col) for col in COMPARABLES_COLUMNS}
+
+    return df, errors
+
+
 if __name__ == "__main__":
     # A quick manual smoke test you can run directly:
     #   python sec_edgar.py META
@@ -1004,3 +1321,14 @@ if __name__ == "__main__":
     for stmt in STATEMENTS:
         print(f"\n=== {stmt} ===")
         print(build_statement(cik, stmt))
+
+    # Comparables Analysis smoke test -- pass a few tickers to try it,
+    # e.g.: python sec_edgar.py META GOOG AMZN MSFT ORCL NVDA
+    if len(sys.argv) > 2:
+        print("\n=== Comparables Analysis ===")
+        comps_df, comps_errors = build_comparables_table(sys.argv[1:])
+        print(comps_df)
+        if comps_errors:
+            print("\nSkipped tickers:")
+            for bad_ticker, reason in comps_errors.items():
+                print(f"  {bad_ticker}: {reason}")

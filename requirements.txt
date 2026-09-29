@@ -3,3 +3,4 @@ pandas>=2.2
 requests>=2.32
 python-dotenv>=1.0
 pytest>=8.0
+finvizfinance>=1.5
