@@ -47,9 +47,49 @@ from typing import Callable
 
 import pandas as pd
 import requests
+import finvizfinance.quote as _finviz_quote_module
 from finvizfinance.quote import finvizfinance as _FinvizQuote
+from finvizfinance.util import number_convert as _finviz_number_convert
 
 import config
+
+# --- Patch a real bug in finvizfinance 1.5.0's own number_convert() ---
+# As of late Sept 2026, finviz.com started returning some fundament
+# fields as whitespace-only text (e.g. a non-breaking space) instead
+# of an actual value or a "-" placeholder. finvizfinance's own
+# number_convert() only special-cases a TRULY empty string or a literal
+# "-" (checked BEFORE it strips whitespace), so a whitespace-only value
+# slips past that check, gets stripped down to "", and then a bare
+# `num[-1]` blows up with "IndexError: string index out of range" --
+# an error that isn't even caught by finvizfinance's own `except
+# ValueError`, so it propagates all the way up and (via our own broad
+# except in get_market_data() below) shows up as "Couldn't get Finviz
+# market data for '<TICKER>': string index out of range" for every
+# single ticker, every time -- exactly the kind of "Finviz redesigned
+# their page and broke this overnight" failure the module docstring
+# above warns about.
+#
+# There's no reasonable upstream fix to wait on, so we patch it
+# ourselves: a safe wrapper that treats a whitespace-only (or "-")
+# value as "no data" (None) instead of crashing, then defers to
+# finvizfinance's real logic for everything else. quote.py did
+# `from finvizfinance.util import number_convert`, which copies the
+# NAME into quote.py's own module namespace -- so patching
+# finvizfinance.util.number_convert alone wouldn't affect the copy
+# quote.py already looked up. We have to reassign the name where
+# quote.py actually reads it from: finvizfinance.quote.number_convert.
+
+
+def _safe_finviz_number_convert(num: str) -> float | None:
+    if num is None:
+        return None
+    stripped = num.strip()
+    if not stripped or stripped == "-":
+        return None
+    return _finviz_number_convert(stripped)
+
+
+_finviz_quote_module.number_convert = _safe_finviz_number_convert
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL_TMPL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:0>10}.json"
@@ -1016,22 +1056,29 @@ def company_name(cik: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Comparables Analysis (Tier 3) -- Price / Market Cap / TEV / Sales /
-# EBITDA / EBIT / Earnings / valuation multiples across up to 10
+# Comparables Analysis (Tier 3) -- Price / Market Cap / EV / Sales /
+# EBITDA / EBIT / Earnings / Beta / valuation multiples across up to 10
 # companies at once, matching the standard sell-side comps table
 # format. See the module docstring for why market data comes from
 # Finviz rather than SEC, and Charter Section 5 for the full design
 # writeup (period alignment, TTM math, the star-marking rule).
+#
+# Note on naming: "TEV" (Total Enterprise Value) and "EV" (Enterprise
+# Value) mean the same thing -- Kevin asked for the shorter "EV" label
+# to match how he labels it on his own comps sheets, so that's what
+# this column (and the EV/Sales, EV/EBITDA, EV/EBIT multiples that
+# divide by it) is called everywhere below.
 # ---------------------------------------------------------------------------
 
 COMPARABLES_COLUMNS = [
     "Price",
     "Market Cap",
-    "TEV",
+    "EV",
     "Sales",
     "EBITDA",
     "EBIT",
     "Earnings",
+    "Beta",
     "EV/Sales",
     "EV/EBITDA",
     "EV/EBIT",
@@ -1044,6 +1091,13 @@ COMPARABLES_COLUMNS = [
 # exactly what the real comps table screenshot this was built from
 # shows too (blank Market Data / Financial Data cells on those rows).
 _COMPARABLES_MULTIPLE_COLUMNS = ["EV/Sales", "EV/EBITDA", "EV/EBIT", "P/E"]
+
+# Beta gets an Average too (a plain arithmetic mean, same as the four
+# multiples above), but no Median -- Kevin only asked for the average,
+# and it isn't part of the original screenshot's Valuation block, so it
+# gets its own small list rather than joining _COMPARABLES_MULTIPLE_COLUMNS
+# (which drives BOTH Average and Median).
+_COMPARABLES_AVERAGE_ONLY_COLUMNS = ["Beta"]
 
 
 def get_market_data(ticker: str) -> dict[str, float | None]:
@@ -1122,10 +1176,12 @@ def comparables_field_formats() -> dict[str, str]:
     """Maps each build_comparables_table() column to a display-format
     hint: 'price' ($/share, 2 decimals), 'dollar_m' (a dollar figure
     shown in millions -- the standard way a comps table is presented;
-    nobody prints a market cap out to the individual dollar), or
-    'multiple' (one decimal place plus an 'x' suffix, e.g. "14.1x")."""
-    formats = {"Price": "price"}
-    for col in ["Market Cap", "TEV", "Sales", "EBITDA", "EBIT", "Earnings"]:
+    nobody prints a market cap out to the individual dollar), 'beta'
+    (a plain two-decimal number, e.g. "0.98" -- betas are already a
+    small unitless ratio, so unlike 'multiple' there's no 'x' suffix),
+    or 'multiple' (one decimal place plus an 'x' suffix, e.g. "14.1x")."""
+    formats = {"Price": "price", "Beta": "beta"}
+    for col in ["Market Cap", "EV", "Sales", "EBITDA", "EBIT", "Earnings"]:
         formats[col] = "dollar_m"
     for col in _COMPARABLES_MULTIPLE_COLUMNS:
         formats[col] = "multiple"
@@ -1133,11 +1189,12 @@ def comparables_field_formats() -> dict[str, str]:
 
 
 def build_comparables_table(tickers: list[str]) -> tuple[pd.DataFrame, dict[str, str]]:
-    """The Comparables Analysis table: Price / Market Cap / TEV / Sales /
-    EBITDA / EBIT / Earnings / EV-Sales / EV-EBITDA / EV-EBIT / P-E for
-    up to MAX_COMPARABLES_TICKERS tickers, plus Average and Median
-    summary rows over the four valuation-multiple columns -- built to
-    match a standard sell-side comps table exactly.
+    """The Comparables Analysis table: Price / Market Cap / EV / Sales /
+    EBITDA / EBIT / Earnings / Beta / EV-Sales / EV-EBITDA / EV-EBIT /
+    P-E for up to MAX_COMPARABLES_TICKERS tickers, plus Average and
+    Median summary rows over the four valuation-multiple columns (and
+    an Average-only row for Beta) -- built to match a standard
+    sell-side comps table exactly.
 
     Definitions (Charter Section 5 has the full writeup):
     - Sales / EBITDA / EBIT / Earnings are trailing-twelve-months (TTM)
@@ -1148,10 +1205,12 @@ def build_comparables_table(tickers: list[str]) -> tuple[pd.DataFrame, dict[str,
       treated as Operating income directly, the standard shorthand
       every comps table uses.
     - Price, Market Cap, and Beta come from Finviz (see the module
-      docstring). TEV = Market Cap + Total debt - Cash and cash
-      equivalents, with a missing debt or cash figure treated as $0
-      rather than leaving TEV blank -- a company with no reported debt
-      tag usually means it has none, not that the number is unknown.
+      docstring). EV (Enterprise Value -- some call it TEV, Total
+      Enterprise Value, same thing) = Market Cap + Total debt - Cash
+      and cash equivalents, with a missing debt or cash figure treated
+      as $0 rather than leaving EV blank -- a company with no reported
+      debt tag usually means it has none, not that the number is
+      unknown.
     - P/E here is Market Cap / Earnings (TTM), computed from OUR OWN
       EDGAR-sourced earnings figure -- not Finviz's own P/E -- so it's
       built the same consistent way as the other three multiples. This
@@ -1211,20 +1270,22 @@ def build_comparables_table(tickers: list[str]) -> tuple[pd.DataFrame, dict[str,
             market = get_market_data(ticker)
             price = market.get("Price")
             market_cap = market.get("Market Cap")
+            beta = market.get("Beta")
 
-            tev = market_cap + (total_debt or 0.0) - (cash or 0.0) if market_cap is not None else None
+            ev = market_cap + (total_debt or 0.0) - (cash or 0.0) if market_cap is not None else None
 
             rows[name] = {
                 "Price": price,
                 "Market Cap": market_cap,
-                "TEV": tev,
+                "EV": ev,
                 "Sales": sales,
                 "EBITDA": ebitda,
                 "EBIT": ebit,
                 "Earnings": earnings,
-                "EV/Sales": _safe_div(tev, sales),
-                "EV/EBITDA": _safe_div(tev, ebitda),
-                "EV/EBIT": _safe_div(tev, ebit),
+                "Beta": beta,
+                "EV/Sales": _safe_div(ev, sales),
+                "EV/EBITDA": _safe_div(ev, ebitda),
+                "EV/EBIT": _safe_div(ev, ebit),
                 "P/E": _safe_div(market_cap, earnings),
             }
         except (SecEdgarError, MarketDataError) as e:
@@ -1240,6 +1301,9 @@ def build_comparables_table(tickers: list[str]) -> tuple[pd.DataFrame, dict[str,
             values = df[col].dropna()
             summary["Average"][col] = float(values.mean()) if not values.empty else None
             summary["Median"][col] = float(values.median()) if not values.empty else None
+        for col in _COMPARABLES_AVERAGE_ONLY_COLUMNS:  # Beta: Average only, no Median
+            values = df[col].dropna()
+            summary["Average"][col] = float(values.mean()) if not values.empty else None
         for label in ("Average", "Median"):
             df.loc[label] = {col: summary[label].get(col) for col in COMPARABLES_COLUMNS}
 
@@ -1259,7 +1323,7 @@ if __name__ == "__main__":
         print(build_statement(cik, stmt))
 
     # Comparables Analysis smoke test -- pass a few tickers to try it,
-    # e.g.: python sec_edgar.py META KO PEP KDP MNST FIZZ
+    # e.g.: python sec_edgar.py META GOOG AMZN MSFT ORCL NVDA
     if len(sys.argv) > 2:
         print("\n=== Comparables Analysis ===")
         comps_df, comps_errors = build_comparables_table(sys.argv[1:])
