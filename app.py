@@ -86,7 +86,18 @@ with st.sidebar:
     fetch_clicked_top = st.button("Fetch data", type="primary", key="fetch_top")
     ticker = st.text_input("Ticker", value="META").strip().upper()
     statement = st.selectbox("Statement", ALL_STATEMENTS)
-    n_periods = st.slider("How many recent quarters?", min_value=1, max_value=8, value=4)
+
+    # Tier 4: Annual (10-K) vs. Quarterly (10-Q) -- a straight choice
+    # between reported fiscal quarters (the app's original behavior)
+    # and reported full fiscal years, not a computed TTM or anything
+    # else. sec_edgar.build_statement()'s period_type param does the
+    # real work; this radio just picks which string to pass it.
+    period_type_choice = st.radio(
+        "Period type", ["Quarterly (10-Q)", "Annual (10-K)"], horizontal=True
+    )
+    period_type = "annual" if period_type_choice.startswith("Annual") else "quarterly"
+    n_periods_label = "How many recent fiscal years?" if period_type == "annual" else "How many recent quarters?"
+    n_periods = st.slider(n_periods_label, min_value=1, max_value=8, value=4)
 
     st.header("Fields to show")
     if "preset_choice" not in st.session_state:
@@ -151,11 +162,25 @@ with tab_single:
             try:
                 cik = sec_edgar.get_cik_for_ticker(ticker)
                 name = sec_edgar.company_name(cik)
-                df = sec_edgar.build_statement(cik, statement, n_periods=n_periods)
-                st.session_state.df = df
-                st.session_state.company = f"{name} ({ticker}) -- CIK {cik}"
-                st.session_state.statement = statement
-                st.session_state.ticker = ticker
+                df = sec_edgar.build_statement(cik, statement, n_periods=n_periods, period_type=period_type)
+                if df.empty or len(df.columns) == 0:
+                    # Most likely: Annual was picked for a company with
+                    # no 10-K data under any of this statement's tags
+                    # (a very recent IPO, say) -- a blank table with no
+                    # explanation would look like a bug, not a "there's
+                    # genuinely nothing here" result.
+                    st.session_state.df = None
+                    period_word = "annual (10-K)" if period_type == "annual" else "quarterly (10-Q)"
+                    st.warning(
+                        f"No {period_word} data found for {ticker} in {statement}. "
+                        + ("Try Quarterly instead." if period_type == "annual" else "Try Annual instead.")
+                    )
+                else:
+                    st.session_state.df = df
+                    st.session_state.company = f"{name} ({ticker}) -- CIK {cik}"
+                    st.session_state.statement = statement
+                    st.session_state.ticker = ticker
+                    st.session_state.period_type = period_type
             except sec_edgar.SecEdgarError as e:
                 st.session_state.df = None
                 st.error(str(e))
@@ -163,7 +188,9 @@ with tab_single:
     if st.session_state.df is not None:
         df = st.session_state.df
         shown_statement = st.session_state.statement
-        st.subheader(f"{shown_statement} -- {st.session_state.company}")
+        shown_period_type = st.session_state.get("period_type", "quarterly")
+        period_suffix = " (Annual, 10-K)" if shown_period_type == "annual" else ""
+        st.subheader(f"{shown_statement} -- {st.session_state.company}{period_suffix}")
 
         # Format each row according to what kind of number it holds --
         # dollar figures get comma separators, margins print as a percent,

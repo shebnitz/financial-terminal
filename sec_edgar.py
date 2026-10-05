@@ -121,10 +121,25 @@ def _cache_path(key: str) -> str:
     return os.path.join(config.CACHE_DIR, f"{safe_key}.json")
 
 
+# Tier 4 (Polish & Robustness): retry a transient failure -- a network
+# hiccup, SEC's own servers briefly struggling (5xx), or SEC asking us
+# to slow down (429) -- instead of either crashing the whole app with a
+# raw requests exception, or giving up on the very first blip. Three
+# tries total, waiting longer between each (2s, then 4s): enough to
+# ride out a momentary problem without making a real outage feel like
+# the app hung.
+_MAX_HTTP_ATTEMPTS = 3
+_BACKOFF_BASE_SECONDS = 2.0
+
+
 def _get_json(url: str, cache_key: str) -> dict:
     """GET a URL as JSON, using an on-disk cache so repeated Streamlit
     reruns don't hammer SEC's servers (and so the app feels instant on
-    the second load)."""
+    the second load). Retries a transient failure (network error, SEC
+    5xx, SEC 429 rate-limiting) with backoff before giving up -- see
+    _MAX_HTTP_ATTEMPTS above -- and every failure that reaches the
+    caller is a plain-English SecEdgarError, never a raw requests
+    exception."""
     path = _cache_path(cache_key)
 
     if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < config.CACHE_TTL_SECONDS:
@@ -138,21 +153,77 @@ def _get_json(url: str, cache_key: str) -> dict:
             "open config.py (or your .env file) and fill in your own details."
         )
 
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    if resp.status_code == 404:
-        raise SecEdgarError(f"SEC EDGAR returned 404 for {url}. Double check the ticker/CIK.")
-    if resp.status_code == 403:
-        raise SecEdgarError(
-            "SEC EDGAR returned 403 (forbidden). This almost always means the "
-            "User-Agent header was rejected -- check EDGAR_CONTACT_EMAIL in "
-            "config.py / .env."
-        )
-    resp.raise_for_status()
+    last_error: str = ""
+    for attempt in range(_MAX_HTTP_ATTEMPTS):
+        is_last_attempt = attempt == _MAX_HTTP_ATTEMPTS - 1
 
-    data = resp.json()
-    with open(path, "w") as f:
-        json.dump(data, f)
-    return data
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+        except requests.exceptions.RequestException as e:
+            # No connection, DNS failure, timeout, ... -- not something
+            # a different ticker or a code fix can help with, and not
+            # something a different status code check below can catch
+            # either (there was no response at all). Retry like any
+            # other transient failure.
+            last_error = str(e)
+            if not is_last_attempt:
+                time.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
+                continue
+            raise SecEdgarError(
+                f"Couldn't reach SEC EDGAR after {_MAX_HTTP_ATTEMPTS} attempts -- this usually "
+                f"means a network problem on this machine, or SEC's own site being down. "
+                f"Last error: {last_error}. Try again in a moment."
+            ) from e
+
+        if resp.status_code == 404:
+            raise SecEdgarError(f"SEC EDGAR returned 404 for {url}. Double check the ticker/CIK.")
+        if resp.status_code == 403:
+            raise SecEdgarError(
+                "SEC EDGAR returned 403 (forbidden). This almost always means the "
+                "User-Agent header was rejected -- check EDGAR_CONTACT_EMAIL in "
+                "config.py / .env."
+            )
+        if resp.status_code == 429:
+            # SEC's fair-access guidance asks for no more than ~10
+            # requests/second; the disk cache normally keeps this app
+            # well under that, but a burst of brand-new lookups (e.g. a
+            # fresh 10-ticker Comparables Analysis run) could still trip
+            # it. Respect a Retry-After header if SEC sends one, since
+            # that's SEC telling us exactly how long to wait.
+            if not is_last_attempt:
+                retry_after = resp.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else _BACKOFF_BASE_SECONDS * (2**attempt)
+                time.sleep(delay)
+                continue
+            raise SecEdgarError(
+                f"SEC EDGAR is rate-limiting this app (HTTP 429), even after "
+                f"{_MAX_HTTP_ATTEMPTS} attempts with backoff. SEC asks for no more than "
+                f"~10 requests/second -- wait a minute and try again."
+            )
+        if resp.status_code >= 500:
+            # A server-side problem at SEC, not something a retry of
+            # THIS app's own logic would fix -- but a genuinely
+            # transient 5xx (SEC deploying, briefly overloaded) often
+            # clears up within a few seconds.
+            last_error = f"HTTP {resp.status_code}"
+            if not is_last_attempt:
+                time.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
+                continue
+            raise SecEdgarError(
+                f"SEC EDGAR returned a server error (HTTP {resp.status_code}) after "
+                f"{_MAX_HTTP_ATTEMPTS} attempts -- this means SEC's own systems are having "
+                f"trouble, not a bug in this app. Try again shortly."
+            )
+        resp.raise_for_status()  # anything else unexpected -- surfaces as a normal requests error
+
+        data = resp.json()
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return data
+
+    # Unreachable in practice (every branch above either returns or
+    # raises), but keeps this function's return type honest.
+    raise SecEdgarError(f"Couldn't reach SEC EDGAR: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -873,11 +944,17 @@ def _facts_for_tag(company_facts: dict, tag: str, unit: str = "USD") -> list[dic
         return []
 
 
-def _quarterly_points(entries: list[dict], kind: str) -> dict[str, dict]:
-    """Reduce raw fact entries down to one value per fiscal quarter,
-    keyed by period end date, keeping only 10-Q / 10-K filed values
-    (skips restated/duplicate values from other filings when possible
-    by preferring the most-recently-filed one).
+def _quarterly_points(entries: list[dict], kind: str, period_type: str = "quarterly") -> dict[str, dict]:
+    """Reduce raw fact entries down to one value per fiscal PERIOD, keyed
+    by period end date, keeping only 10-Q / 10-K filed values (skips
+    restated/duplicate values from other filings when possible by
+    preferring the most-recently-filed one).
+
+    `period_type` (Tier 4): "quarterly" (the default -- one value per
+    fiscal quarter, ~90 days) or "annual" (one value per fiscal YEAR,
+    ~365 days, from 10-K filings only). Quarterly is everything this
+    function originally did; annual is a separate, simpler pass -- see
+    below.
 
     Some cash-flow-statement line items are only ever tagged
     cumulatively -- six months, nine months, a full year -- and NEVER
@@ -896,17 +973,28 @@ def _quarterly_points(entries: list[dict], kind: str) -> dict[str, dict]:
     previous period's cumulative total, walked forward one fiscal year
     at a time. A period end that never gets an earlier cumulative
     point to subtract from (e.g. no Q1 was ever reported) is left
-    unfilled rather than guessed at."""
+    unfilled rather than guessed at. This derivation is a QUARTERLY
+    concept only -- in annual mode the full-year total is already
+    exactly what we want, directly reported, so there's nothing to
+    derive."""
+    annual = period_type == "annual"
+    # Annual totals are what a 10-K itself reports -- a 10-Q would only
+    # carry one in an unusual restated/trailing disclosure, so annual
+    # mode requires form=="10-K" specifically rather than accepting
+    # either filing type the way quarterly mode does.
+    allowed_forms = ("10-K",) if annual else ("10-Q", "10-K")
+
     by_end: dict[str, dict] = {}
     # For "duration" facts, every entry sharing the same `start` date
     # belongs to the same fiscal-year cumulative chain (regardless of
     # what that start date's actual month/day is, so this works for
     # non-calendar fiscal years too) -- collected here so the second
-    # pass below can walk each chain from earliest to latest.
+    # pass below can walk each chain from earliest to latest. Only
+    # needed in quarterly mode (see the docstring above).
     by_start: dict[str, dict[str, dict]] = {}
 
     for e in entries:
-        if e.get("form") not in ("10-Q", "10-K"):
+        if e.get("form") not in allowed_forms:
             continue
         if kind == "duration":
             start = e.get("start")
@@ -915,23 +1003,30 @@ def _quarterly_points(entries: list[dict], kind: str) -> dict[str, dict]:
                 continue
             days = (pd.Timestamp(end) - pd.Timestamp(start)).days
 
-            chain = by_start.setdefault(start, {})
-            existing_chain_entry = chain.get(end)
-            if existing_chain_entry is None or e["filed"] > existing_chain_entry["filed"]:
-                chain[end] = e
+            if annual:
+                if not (350 <= days <= 380):
+                    # Not a full fiscal year -- annual mode has no use
+                    # for a shorter window, and (unlike quarterly mode)
+                    # there's no cumulative-chain derivation to feed.
+                    continue
+            else:
+                chain = by_start.setdefault(start, {})
+                existing_chain_entry = chain.get(end)
+                if existing_chain_entry is None or e["filed"] > existing_chain_entry["filed"]:
+                    chain[end] = e
 
-            if not (75 <= days <= 100):
-                # Not a standalone quarter -- it may still be useful as
-                # a cumulative point in the second pass below, but it
-                # doesn't go directly into by_end.
-                continue
+                if not (75 <= days <= 100):
+                    # Not a standalone quarter -- it may still be useful
+                    # as a cumulative point in the second pass below,
+                    # but it doesn't go directly into by_end.
+                    continue
 
         end = e["end"]
         existing = by_end.get(end)
         if existing is None or e["filed"] > existing["filed"]:
             by_end[end] = e
 
-    if kind == "duration":
+    if kind == "duration" and not annual:
         for start, chain in by_start.items():
             ordered_ends = sorted(chain, key=lambda end: pd.Timestamp(end))
             prev_cumulative_val = None
@@ -961,13 +1056,24 @@ def _quarterly_points(entries: list[dict], kind: str) -> dict[str, dict]:
     return by_end
 
 
-def build_statement(cik: str, statement: str, n_periods: int = 4) -> pd.DataFrame:
+def build_statement(
+    cik: str, statement: str, n_periods: int = 4, period_type: str = "quarterly"
+) -> pd.DataFrame:
     """Build a statement as a DataFrame: rows are line items (raw fields
     from STATEMENTS, followed by that statement's DERIVED_METRICS),
-    columns are the most recent `n_periods` fiscal quarter-end dates,
-    most recent first."""
+    columns are the most recent `n_periods` fiscal period-end dates,
+    most recent first.
+
+    `period_type` (Tier 4): "quarterly" (the default) builds from 10-Q
+    filings (plus 10-K quarters), the same as always. "annual" builds
+    from 10-K filings only -- each column is a fiscal YEAR, not a
+    quarter, e.g. for a company with 6 years of history and
+    n_periods=4, you get its 4 most recent fiscal years. See
+    _quarterly_points() for how the two differ under the hood."""
     if statement not in STATEMENTS:
         raise SecEdgarError(f"Unknown statement '{statement}'. Choose one of {list(STATEMENTS)}.")
+    if period_type not in ("quarterly", "annual"):
+        raise SecEdgarError(f"Unknown period_type '{period_type}'. Choose 'quarterly' or 'annual'.")
 
     company_facts = get_company_facts(cik)
     line_items = STATEMENTS[statement]
@@ -991,7 +1097,7 @@ def build_statement(cik: str, statement: str, n_periods: int = 4) -> pd.DataFram
         points: dict[str, dict] = {}
         for tag in item.tags:
             entries = _facts_for_tag(company_facts, tag, unit=item.unit)
-            tag_points = _quarterly_points(entries, item.kind)
+            tag_points = _quarterly_points(entries, item.kind, period_type=period_type)
             for end, point in tag_points.items():
                 points.setdefault(end, point)
         row_data[item.label] = {end: point["val"] * item.sign for end, point in points.items()}
